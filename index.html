@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>うどんマップ</title>
+  <meta name="description" content="九州のうどん店をさがせるマップ。お気に入り同期に対応。" />
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=" />
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <h1 class="brand">うどんマップへようこそ</h1>
+      <div class="auth" id="authArea"></div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button data-tab="home" class="tab active">ホーム</button>
+      <button data-tab="favorites" class="tab">マイページ</button>
+      <button data-tab="new" class="tab">新規登録</button>
+    </nav>
+  </header>
+
+  <main id="app" role="main" aria-live="polite"></main>
+
+  <footer class="footer">
+    <small>© 2025 Udon Map</small>
+  </footer>
+
+  <!-- ES Module として読み込む（Firebase SDK も app.js 内で import） -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
