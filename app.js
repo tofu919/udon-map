@@ -6,23 +6,34 @@ import {
   getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFirestore, collection, doc, getDoc, getDocs, query, where, addDoc,
-  setDoc, deleteDoc, serverTimestamp, orderBy, onSnapshot, writeBatch, limit
+  getFirestore, enableIndexedDbPersistence,
+  collection, doc, getDoc, getDocs, query, where, addDoc,
+  setDoc, deleteDoc, serverTimestamp, orderBy, onSnapshot, limit, writeBatch
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
-// --- あなたのFirebase設定に差し替え ---
+// =========================
+// Firebase config（差し替え）
+// =========================
 const firebaseConfig = {
   apiKey: "AIzaSyCTDbkmGXMH1YDkLIgOH_yBWKCUYOMgoSg",
   authDomain: "udon-map.firebaseapp.com",
   projectId: "udon-map"
 };
-// ---------------------------------------
 
+// =========================
+// App bootstrap
+// =========================
 const appFB = initializeApp(firebaseConfig);
 const auth = getAuth(appFB);
 const db   = getFirestore(appFB);
 
+// オフライン耐性（任意で有効化）
+enableIndexedDbPersistence(db).catch(() => { /* Safari等で失敗することあり */ });
+
 const PREFS = ["福岡","佐賀","長崎","熊本","大分","宮崎","鹿児島"];
+
+// 複合インデックスがREADYになるまで false にしておくと並び替えなしで表示（エラー回避）
+let USE_INDEXED_ORDER_FOR_SUBMISSIONS = false;
 
 let currentUser = null;
 let state = {
@@ -34,9 +45,9 @@ let state = {
 const $ = sel => document.querySelector(sel);
 const appRoot = $('#app');
 
-// --------------------
+// =========================
 // Auth UI
-// --------------------
+// =========================
 function renderAuthArea(){
   const el = $('#authArea');
   if(!el) return;
@@ -71,9 +82,9 @@ onAuthStateChanged(auth, (user)=>{
   render();
 });
 
-// --------------------
+// =========================
 // Helpers
-// --------------------
+// =========================
 function mapsLinkFromAddress(address){
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address||"")}`;
 }
@@ -91,16 +102,15 @@ function loader(text="読み込み中…"){
 }
 function normalize(str){ return (str||"").trim(); }
 function normalizeKey(str){
-  // 重複検知用の簡易キー（全角→半角/空白削除/小文字化）
   return (str||"")
     .replace(/\s+/g,"")
     .replace(/[Ａ-Ｚａ-ｚ０-９]/g, s=>String.fromCharCode(s.charCodeAt(0)-0xFEE0))
     .toLowerCase();
 }
 
-// --------------------
+// =========================
 // shops（公開データ）
-// --------------------
+// =========================
 async function fetchShopsByPref(pref, keyword=""){
   const qCol = collection(db, "shops");
   const qy = query(qCol, where("pref","==",pref), where("status","==","published"));
@@ -117,10 +127,9 @@ async function fetchShopsByPref(pref, keyword=""){
   return rows;
 }
 
-// --------------------
-// Favorites（効率版）
-// --------------------
-import { onSnapshot as onSnap } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+// =========================
+// Favorites（効率化：一括購読）
+// =========================
 let favUnsub = null;
 let favSet = new Set(); // shopId の集合
 
@@ -128,9 +137,8 @@ function startWatchFavorites() {
   if (favUnsub) { favUnsub(); favUnsub=null; }
   if (!currentUser) { favSet = new Set(); return; }
   const col = collection(db, "users", currentUser.uid, "favorites");
-  favUnsub = onSnap(col, snap => {
+  favUnsub = onSnapshot(col, snap => {
     favSet = new Set(snap.docs.map(d => d.id));
-    // 画面の⭐を即時更新
     if (state.tab === "home" || state.tab === "favorites") render();
   });
 }
@@ -148,7 +156,6 @@ async function toggleFav(shop){
     if (existed) await deleteDoc(favRef);
     else await setDoc(favRef, { shopRef: doc(db,"shops",shop.id), createdAt: serverTimestamp() });
   } catch(e){
-    // ロールバック
     if (existed) favSet.add(shop.id); else favSet.delete(shop.id);
     render();
     alert("更新に失敗しました: " + e.message);
@@ -170,14 +177,10 @@ async function fetchFavorites(){
   return results;
 }
 
-// --------------------
+// =========================
 // Submissions（新規登録）
-//  - バリデーション
-//  - 重複チェック（pref＋name/addressの簡易一致）
-//  - レート制限（クライアントで60秒/回 + ペンディング上限）
-//  - 自分の申請一覧の表示・編集（pendingのみ）・削除
-// --------------------
-const SUBMIT_COOLDOWN_MS = 60 * 1000; // 60s
+// =========================
+const SUBMIT_COOLDOWN_MS = 60 * 1000; // 60秒
 const PENDING_LIMIT_PER_USER = 10;
 
 function getLastSubmitTs(){
@@ -186,32 +189,18 @@ function getLastSubmitTs(){
 function setLastSubmitTs(ts){ try{ localStorage.setItem("udon_submit_lastts", String(ts)); }catch(_e){} }
 
 async function hasPendingQuota(){
-  if(!currentUser) return true; // 未ログインはクライアント側で弾くのでここは通る
-// 申請一覧を読み込む部分（元の orderBy 付きクエリ部分をこれに置き換え）
-let rows = [];
-try {
-  // インデックス未完成時は orderBy を外して応急対応
+  if(!currentUser) return true;
   const qy = query(
     collection(db,"submissions"),
-    where("submittedByUid","==", currentUser.uid)
-    // orderBy("createdAt","desc") // インデックス完成後に戻す
+    where("submittedByUid","==", currentUser.uid),
+    where("status","==","pending"),
+    limit(PENDING_LIMIT_PER_USER)
   );
   const snap = await getDocs(qy);
-  rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-} catch (e) {
-  const box = document.createElement('div');
-  box.className = 'empty';
-  box.textContent = '申請一覧の取得でエラー：' + (e.message || e);
-  listWrap.replaceChildren(box);
-  console.error(e);
-  return; // エラー時はここで終了
-}
-
   return snap.size < PENDING_LIMIT_PER_USER;
 }
 
 async function checkDuplicate(pref, name, address){
-  // 既存shops（published）に同名 or 同住所があれば重複判定
   const rows = await fetchShopsByPref(pref, "");
   const keyName = normalizeKey(name);
   const keyAddr = normalizeKey(address);
@@ -224,24 +213,21 @@ async function checkDuplicate(pref, name, address){
 async function submitNewShop(model){
   const now = Date.now();
 
-  // レート制限（クライアント側）
+  // レート制限
   const last = getLastSubmitTs();
   if (now - last < SUBMIT_COOLDOWN_MS){
     const sec = Math.ceil((SUBMIT_COOLDOWN_MS - (now-last))/1000);
     throw new Error(`送信間隔が短すぎます。${sec}秒後に再度お試しください。`);
   }
 
-  // ログイン推奨（未ログインでも受け付けたい場合はここを外す）
   if(!currentUser){
     throw new Error("申請はログインが必要です（審査状況の確認・編集のため）");
   }
 
-  // ペンディング上限
   if(!(await hasPendingQuota())){
     throw new Error(`審査中の申請が上限（${PENDING_LIMIT_PER_USER}件）に達しています。結果が出るまでお待ちください。`);
   }
 
-  // 重複チェック
   const dup = await checkDuplicate(model.pref, model.name, model.address);
   if (dup){
     throw new Error(`既に掲載済みの可能性があります：「${dup.name}」（${dup.address||""}）`);
@@ -266,19 +252,46 @@ async function submitNewShop(model){
   setLastSubmitTs(now);
 }
 
-// 自分の申請一覧（最新順）
 async function fetchMySubmissions(){
   if(!currentUser) return [];
-  const qy = query(
-    collection(db,"submissions"),
-    where("submittedByUid","==", currentUser.uid),
-    orderBy("createdAt","desc")
-  );
-  const snap = await getDocs(qy);
-  return snap.docs.map(d=>({ id:d.id, ...d.data() }));
+  try {
+    let qy;
+    if (USE_INDEXED_ORDER_FOR_SUBMISSIONS) {
+      // インデックス: submissions / (submittedByUid Asc, createdAt Desc)
+      qy = query(
+        collection(db,"submissions"),
+        where("submittedByUid","==", currentUser.uid),
+        orderBy("createdAt","desc")
+      );
+    } else {
+      // 応急：並び順なし（インデックス不要）
+      qy = query(
+        collection(db,"submissions"),
+        where("submittedByUid","==", currentUser.uid)
+      );
+    }
+    const snap = await getDocs(qy);
+    const rows = snap.docs.map(d=>({ id:d.id, ...d.data() }));
+    // 応急モード時はフロントで降順ソート
+    if (!USE_INDEXED_ORDER_FOR_SUBMISSIONS) {
+      rows.sort((a,b)=>{
+        const ta = a.createdAt?.toMillis?.() ?? 0;
+        const tb = b.createdAt?.toMillis?.() ?? 0;
+        return tb - ta;
+      });
+    }
+    return rows;
+  } catch (e) {
+    if (e.code === 'failed-precondition') {
+      throw new Error('インデックス未作成または向き不一致です（submittedByUid Asc / createdAt Desc で作成してください）');
+    }
+    if (e.code === 'permission-denied') {
+      throw new Error('権限エラー：ルールまたはログイン状態を確認してください');
+    }
+    throw e;
+  }
 }
 
-// 申請編集（pendingのみ）
 async function updateSubmission(id, patch){
   const ref = doc(db,"submissions", id);
   const cur = await getDoc(ref);
@@ -295,7 +308,6 @@ async function updateSubmission(id, patch){
   await setDoc(ref, next, { merge: true });
 }
 
-// 申請削除（pendingのみ）
 async function deleteSubmission(id){
   const ref = doc(db,"submissions", id);
   const cur = await getDoc(ref);
@@ -306,9 +318,9 @@ async function deleteSubmission(id){
   await deleteDoc(ref);
 }
 
-// --------------------
-// Views
-// --------------------
+// =========================
+/* Views */
+// =========================
 async function render(){
   document.querySelectorAll('.tab').forEach(btn=>{
     btn.classList.toggle('active', btn.dataset.tab === state.tab);
@@ -478,7 +490,7 @@ async function renderFavorites(){
   listWrap.replaceChildren(list);
 }
 
-// 新規登録（審査制・実運用版）
+// 新規登録（審査制・実運用）
 function renderNew(){
   const container = document.createElement('div');
   container.className='container';
@@ -509,15 +521,12 @@ function renderNew(){
   const send = document.createElement('button'); send.className='btn btn-primary'; send.textContent='申請する';
   send.onclick = async ()=>{
     try{
-      // クライアント側バリデーション
       if(!normalize(model.name) || !normalize(model.address)){
         alert('店名と住所は必須です'); return;
       }
-      // 送信
       await submitNewShop(model);
       alert('送信しました。審査後に掲載されます。');
-      // 送信後は自分の申請一覧を表示
-      renderMySubmissionsView(container);
+      renderMySubmissionsView(container); // 送信後すぐ自分の申請一覧を表示
     }catch(e){
       alert(e.message);
     }
@@ -529,14 +538,12 @@ function renderNew(){
   form.appendChild(actions);
   container.append(title,form);
 
-  // 補助メッセージ
   if(!currentUser){
     const note = document.createElement('div');
     note.className = 'empty';
     note.textContent = '※ ログインすると申請の編集・削除ができ、審査状況も確認できます。';
     container.appendChild(note);
   }else{
-    // 自分の申請一覧（同一画面内に表示）
     renderMySubmissionsView(container);
   }
 
@@ -552,7 +559,7 @@ function renderNew(){
   }
 }
 
-// 自分の申請一覧UI（編集・削除対応）
+// 自分の申請一覧UI（編集・削除対応＆エラー見える化）
 async function renderMySubmissionsView(container){
   const wrap = document.createElement('div');
   wrap.style.marginTop = '16px';
@@ -572,7 +579,18 @@ async function renderMySubmissionsView(container){
   wrap.appendChild(listWrap);
   container.appendChild(wrap);
 
-  const rows = await fetchMySubmissions();
+  let rows = [];
+  try {
+    rows = await fetchMySubmissions();
+  } catch (e) {
+    const box = document.createElement('div');
+    box.className = 'empty';
+    box.textContent = '申請一覧の取得でエラー：' + (e.message || e);
+    listWrap.replaceChildren(box);
+    console.error(e);
+    return;
+  }
+
   if(rows.length===0){
     const empty = document.createElement('div'); empty.className='empty';
     empty.textContent = '申請はまだありません。';
@@ -599,6 +617,7 @@ async function renderMySubmissionsView(container){
     map.textContent='地図';
 
     const canEdit = r.status === "pending" && currentUser && r.submittedByUid === currentUser.uid;
+
     const edit = document.createElement('button'); edit.className='btn btn-outline'; edit.textContent='編集';
     edit.disabled = !canEdit;
     edit.onclick = async ()=>{
@@ -626,9 +645,9 @@ async function renderMySubmissionsView(container){
   listWrap.replaceChildren(list);
 }
 
-// --------------------
+// =========================
 // Tabs
-// --------------------
+// =========================
 document.getElementById('tabs').addEventListener('click', (e)=>{
   const btn = e.target.closest('button.tab');
   if(!btn) return;
@@ -638,3 +657,12 @@ document.getElementById('tabs').addEventListener('click', (e)=>{
 
 // 初期描画
 render();
+
+/* 使い方メモ：
+ * 1) インデックスが READY になるまでは USE_INDEXED_ORDER_FOR_SUBMISSIONS=false のまま（応急表示）
+ * 2) Firestore Console で Composite Index:
+ *    Collection: submissions
+ *    Fields: submittedByUid Asc, createdAt Desc
+ *    Scope: Collection
+ *    が Enabled になったら、true に変更してデプロイするとサーバー側で並び順が効きます
+ */
