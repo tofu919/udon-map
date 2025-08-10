@@ -187,12 +187,26 @@ function setLastSubmitTs(ts){ try{ localStorage.setItem("udon_submit_lastts", St
 
 async function hasPendingQuota(){
   if(!currentUser) return true; // 未ログインはクライアント側で弾くのでここは通る
-  const qy = query(collection(db,"submissions"),
-    where("submittedByUid","==", currentUser.uid),
-    where("status","==","pending"),
-    limit(PENDING_LIMIT_PER_USER)
+// 申請一覧を読み込む部分（元の orderBy 付きクエリ部分をこれに置き換え）
+let rows = [];
+try {
+  // インデックス未完成時は orderBy を外して応急対応
+  const qy = query(
+    collection(db,"submissions"),
+    where("submittedByUid","==", currentUser.uid)
+    // orderBy("createdAt","desc") // インデックス完成後に戻す
   );
   const snap = await getDocs(qy);
+  rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+} catch (e) {
+  const box = document.createElement('div');
+  box.className = 'empty';
+  box.textContent = '申請一覧の取得でエラー：' + (e.message || e);
+  listWrap.replaceChildren(box);
+  console.error(e);
+  return; // エラー時はここで終了
+}
+
   return snap.size < PENDING_LIMIT_PER_USER;
 }
 
