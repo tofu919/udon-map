@@ -12,9 +12,9 @@ import {
 
 // --- あなたのFirebase設定に差し替え ---
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID"
+  apiKey: "AIzaSyCTDbkmGXMH1YDkLIgOH_yBWKCUYOMgoSg",
+  authDomain: "udon-map.firebaseapp.com",
+  projectId: "udon-map"
 };
 // ---------------------------------------
 
