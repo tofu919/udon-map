@@ -3,12 +3,12 @@
 // =========================
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import {
-  getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut
+  getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut, getIdTokenResult
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
   getFirestore, enableIndexedDbPersistence,
   collection, doc, getDoc, getDocs, query, where, addDoc,
-  setDoc, deleteDoc, serverTimestamp, orderBy, onSnapshot, limit, writeBatch
+  setDoc, deleteDoc, serverTimestamp, orderBy, onSnapshot, limit, writeBatch, startAfter
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 // =========================
@@ -27,15 +27,17 @@ const appFB = initializeApp(firebaseConfig);
 const auth = getAuth(appFB);
 const db   = getFirestore(appFB);
 
-// オフライン耐性（任意で有効化）
-enableIndexedDbPersistence(db).catch(() => { /* Safari等で失敗することあり */ });
+// オフライン（任意）
+enableIndexedDbPersistence(db).catch(()=>{});
 
 const PREFS = ["福岡","佐賀","長崎","熊本","大分","宮崎","鹿児島"];
 
-// 複合インデックスがREADYになるまで false にしておくと並び替えなしで表示（エラー回避）
-let USE_INDEXED_ORDER_FOR_SUBMISSIONS = false;
+// submissions 並び替え：インデックスREADY前はfalse
+let USE_INDEXED_ORDER_FOR_SUBMISSIONS = true;
 
 let currentUser = null;
+let isAdmin = false;
+
 let state = {
   tab: "home",
   selectedPref: null,
@@ -75,9 +77,32 @@ function renderAuthArea(){
   }
   el.appendChild(wrap);
 }
-onAuthStateChanged(auth, (user)=>{
+function ensureAdminTab(){
+  const tabs = $('#tabs');
+  if(!tabs) return;
+  const exists = tabs.querySelector('[data-tab="admin"]');
+  if(isAdmin && !exists){
+    const btn = document.createElement('button');
+    btn.dataset.tab = "admin";
+    btn.className = "tab";
+    btn.textContent = "管理";
+    tabs.appendChild(btn);
+  }else if(!isAdmin && exists){
+    exists.remove();
+    if(state.tab === "admin"){ state.tab = "home"; }
+  }
+}
+onAuthStateChanged(auth, async (user)=>{
   currentUser = user;
+  isAdmin = false;
+  if (user) {
+    try {
+      const token = await getIdTokenResult(user);
+      isAdmin = !!token.claims?.admin;
+    } catch(_e){}
+  }
   renderAuthArea();
+  ensureAdminTab();
   startWatchFavorites();
   render();
 });
@@ -128,7 +153,7 @@ async function fetchShopsByPref(pref, keyword=""){
 }
 
 // =========================
-// Favorites（効率化：一括購読）
+// Favorites（一括購読）
 // =========================
 let favUnsub = null;
 let favSet = new Set(); // shopId の集合
@@ -180,7 +205,7 @@ async function fetchFavorites(){
 // =========================
 // Submissions（新規登録）
 // =========================
-const SUBMIT_COOLDOWN_MS = 60 * 1000; // 60秒
+const SUBMIT_COOLDOWN_MS = 60 * 1000;
 const PENDING_LIMIT_PER_USER = 10;
 
 function getLastSubmitTs(){
@@ -213,7 +238,6 @@ async function checkDuplicate(pref, name, address){
 async function submitNewShop(model){
   const now = Date.now();
 
-  // レート制限
   const last = getLastSubmitTs();
   if (now - last < SUBMIT_COOLDOWN_MS){
     const sec = Math.ceil((SUBMIT_COOLDOWN_MS - (now-last))/1000);
@@ -257,14 +281,12 @@ async function fetchMySubmissions(){
   try {
     let qy;
     if (USE_INDEXED_ORDER_FOR_SUBMISSIONS) {
-      // インデックス: submissions / (submittedByUid Asc, createdAt Desc)
       qy = query(
         collection(db,"submissions"),
         where("submittedByUid","==", currentUser.uid),
         orderBy("createdAt","desc")
       );
     } else {
-      // 応急：並び順なし（インデックス不要）
       qy = query(
         collection(db,"submissions"),
         where("submittedByUid","==", currentUser.uid)
@@ -272,7 +294,6 @@ async function fetchMySubmissions(){
     }
     const snap = await getDocs(qy);
     const rows = snap.docs.map(d=>({ id:d.id, ...d.data() }));
-    // 応急モード時はフロントで降順ソート
     if (!USE_INDEXED_ORDER_FOR_SUBMISSIONS) {
       rows.sort((a,b)=>{
         const ta = a.createdAt?.toMillis?.() ?? 0;
@@ -319,6 +340,39 @@ async function deleteSubmission(id){
 }
 
 // =========================
+// Admin: 承認/却下
+// =========================
+async function adminApproveSubmission(sub){
+  if(!isAdmin){ alert("管理者のみ操作できます"); return; }
+  // shops へコピー + submissions を approved に更新（バッチ）
+  const batch = writeBatch(db);
+  const shopRef = doc(collection(db, "shops"));
+  const subRef  = doc(db, "submissions", sub.id);
+
+  const shopDoc = {
+    pref: sub.pref,
+    name: sub.name,
+    address: sub.address,
+    note: sub.note || "",
+    status: "published",
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    sourceSubmissionId: sub.id,
+    approvedByUid: currentUser.uid
+  };
+  batch.set(shopRef, shopDoc);
+  batch.set(subRef, { status: "approved", approvedAt: serverTimestamp(), approvedShopId: shopRef.id }, { merge: true });
+
+  await batch.commit();
+}
+
+async function adminRejectSubmission(sub, reason="不適切・重複など"){
+  if(!isAdmin){ alert("管理者のみ操作できます"); return; }
+  const subRef = doc(db, "submissions", sub.id);
+  await setDoc(subRef, { status: "rejected", rejectedAt: serverTimestamp(), rejectReason: reason }, { merge: true });
+}
+
+// =========================
 /* Views */
 // =========================
 async function render(){
@@ -329,6 +383,7 @@ async function render(){
   if(state.tab === "home")       await renderHome();
   if(state.tab === "favorites")  await renderFavorites();
   if(state.tab === "new")        await renderNew();
+  if(state.tab === "admin")      await renderAdmin();
 }
 
 // Home
@@ -490,7 +545,7 @@ async function renderFavorites(){
   listWrap.replaceChildren(list);
 }
 
-// 新規登録（審査制・実運用）
+// 新規登録（審査制・ユーザー）
 function renderNew(){
   const container = document.createElement('div');
   container.className='container';
@@ -526,7 +581,7 @@ function renderNew(){
       }
       await submitNewShop(model);
       alert('送信しました。審査後に掲載されます。');
-      renderMySubmissionsView(container); // 送信後すぐ自分の申請一覧を表示
+      renderMySubmissionsView(container);
     }catch(e){
       alert(e.message);
     }
@@ -559,7 +614,7 @@ function renderNew(){
   }
 }
 
-// 自分の申請一覧UI（編集・削除対応＆エラー見える化）
+// 自分の申請一覧UI（編集・削除可）
 async function renderMySubmissionsView(container){
   const wrap = document.createElement('div');
   wrap.style.marginTop = '16px';
@@ -645,6 +700,110 @@ async function renderMySubmissionsView(container){
   listWrap.replaceChildren(list);
 }
 
+// 管理タブ（pending一覧→承認/却下）
+async function renderAdmin(){
+  if(!isAdmin){
+    const c = document.createElement('div'); c.className='container';
+    const box = document.createElement('div'); box.className='empty';
+    box.textContent = '管理者のみアクセスできます。';
+    c.appendChild(box);
+    appRoot.replaceChildren(c);
+    return;
+  }
+
+  const container = document.createElement('div'); container.className='container';
+  container.appendChild(h2('管理：申請の承認・却下'));
+
+  // ツールバー
+  const tools = document.createElement('div'); tools.className='toolbar';
+  const refreshBtn = document.createElement('button'); refreshBtn.className='btn btn-outline'; refreshBtn.textContent='再読み込み';
+  tools.append(refreshBtn);
+  container.appendChild(tools);
+
+  const listWrap = document.createElement('div'); listWrap.appendChild(loader());
+  container.appendChild(listWrap);
+  appRoot.replaceChildren(container);
+
+  // ペンディング取得（最新順）
+  let qy = query(
+    collection(db,"submissions"),
+    where("status","==","pending"),
+    orderBy("createdAt","desc"),
+    limit(50)
+  );
+  let snap;
+  try{
+    snap = await getDocs(qy);
+  }catch(e){
+    // インデックス未作成などの保険
+    qy = query(collection(db,"submissions"), where("status","==","pending"), limit(50));
+    snap = await getDocs(qy);
+  }
+
+  if(snap.empty){
+    const empty = document.createElement('div'); empty.className='empty';
+    empty.textContent = '審査待ちはありません。';
+    listWrap.replaceChildren(empty);
+    return;
+  }
+
+  const list = document.createElement('div'); list.className='list';
+
+  for(const d of snap.docs){
+    const r = { id:d.id, ...d.data() };
+
+    const card = document.createElement('div'); card.className='card';
+    const h3 = document.createElement('h3'); h3.textContent = r.name;
+    const meta = document.createElement('div'); meta.className='meta';
+    meta.innerHTML = `
+      <span class="badge">${r.pref}</span>
+      <div>${r.address??""}</div>
+      ${r.note?`<div>${r.note}</div>`:""}
+      <div class="muted">submittedBy: ${r.submittedByEmail || r.submittedByUid || "-"}</div>
+    `;
+
+    const actions = document.createElement('div'); actions.className='actions';
+
+    const approve = document.createElement('button'); approve.className='btn btn-primary'; approve.textContent='承認して公開';
+    approve.onclick = async ()=>{
+      try{
+        approve.disabled = true;
+        await adminApproveSubmission(r);
+        alert('公開しました（shopsに追加）');
+        render(); // リスト再描画
+      }catch(e){
+        approve.disabled = false;
+        alert('承認に失敗：' + e.message);
+      }
+    };
+
+    const reject = document.createElement('button'); reject.className='btn'; reject.textContent='却下';
+    reject.onclick = async ()=>{
+      const reason = prompt('却下理由（任意）', '重複/情報不足など'); if(reason===null) return;
+      try{
+        reject.disabled = true;
+        await adminRejectSubmission(r, reason);
+        alert('却下しました');
+        render();
+      }catch(e){
+        reject.disabled = false;
+        alert('却下に失敗：' + e.message);
+      }
+    };
+
+    const map = document.createElement('a'); map.className='btn btn-outline';
+    map.href = mapsLinkFromAddress(r.address??""); map.target="_blank"; map.rel="noopener";
+    map.textContent='地図';
+
+    actions.append(approve, reject, map);
+    card.append(h3, meta, actions);
+    list.appendChild(card);
+  }
+  listWrap.replaceChildren(list);
+
+  refreshBtn.onclick = ()=>render();
+}
+
 // =========================
 // Tabs
 // =========================
@@ -658,11 +817,9 @@ document.getElementById('tabs').addEventListener('click', (e)=>{
 // 初期描画
 render();
 
-/* 使い方メモ：
- * 1) インデックスが READY になるまでは USE_INDEXED_ORDER_FOR_SUBMISSIONS=false のまま（応急表示）
- * 2) Firestore Console で Composite Index:
- *    Collection: submissions
- *    Fields: submittedByUid Asc, createdAt Desc
- *    Scope: Collection
- *    が Enabled になったら、true に変更してデプロイするとサーバー側で並び順が効きます
+/* メモ：
+ * - 管理者判定：getIdTokenResult().claims.admin で制御
+ * - 承認: writeBatch で shops へ copy + submissions を approved に
+ * - 却下: submissions.status を rejected
+ * - shops は status: "published" のみ表示（既存UIそのまま）
  */
