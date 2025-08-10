@@ -83,3 +83,13 @@ hr{border:none;height:1px;background:#f1f5f9;margin:16px 0}
 @media (max-width:480px){
   .form-row{grid-template-columns:1fr}
 }
+.pref-button {
+  font-size: 1.2rem; /* 例: 元が1remなら20%アップ */
+  padding: 12px 20px;
+}
+
+@media (max-width: 480px) {
+  .pref-button {
+    font-size: 1.4rem; /* スマホ画面用にさらに拡大 */
+  }
+}
