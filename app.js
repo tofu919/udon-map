@@ -1,5 +1,5 @@
 // =========================
-// Firebase SDK imports
+// Firebase SDK (v10 modular)
 // =========================
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import {
@@ -7,21 +7,17 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
   getFirestore, collection, doc, getDoc, getDocs, query, where, addDoc,
-  setDoc, deleteDoc, serverTimestamp, orderBy
+  setDoc, deleteDoc, serverTimestamp, orderBy, onSnapshot, writeBatch, limit
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
-// =========================
-// Firebase config（差し替え）
-// =========================
+// --- あなたのFirebase設定に差し替え ---
 const firebaseConfig = {
-  apiKey: "AIzaSyCTDbkmGXMH1YDkLIgOH_yBWKCUYOMgoSg",
-  authDomain: "udon-map.firebaseapp.com",
-  projectId: "udon-map"
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID"
 };
+// ---------------------------------------
 
-// =========================
-// App bootstrap
-// =========================
 const appFB = initializeApp(firebaseConfig);
 const auth = getAuth(appFB);
 const db   = getFirestore(appFB);
@@ -38,11 +34,12 @@ let state = {
 const $ = sel => document.querySelector(sel);
 const appRoot = $('#app');
 
-// =========================
+// --------------------
 // Auth UI
-// =========================
+// --------------------
 function renderAuthArea(){
   const el = $('#authArea');
+  if(!el) return;
   el.innerHTML = "";
   const wrap = document.createElement('div');
   wrap.className = "auth";
@@ -70,14 +67,15 @@ function renderAuthArea(){
 onAuthStateChanged(auth, (user)=>{
   currentUser = user;
   renderAuthArea();
-  render(); // ログイン状態でUIを更新（お気に入りなど）
+  startWatchFavorites();
+  render();
 });
 
-// =========================
+// --------------------
 // Helpers
-// =========================
+// --------------------
 function mapsLinkFromAddress(address){
-  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address||"")}`;
 }
 function h2(text){
   const t = document.createElement('h2');
@@ -91,15 +89,22 @@ function loader(text="読み込み中…"){
   d.textContent = text;
   return d;
 }
+function normalize(str){ return (str||"").trim(); }
+function normalizeKey(str){
+  // 重複検知用の簡易キー（全角→半角/空白削除/小文字化）
+  return (str||"")
+    .replace(/\s+/g,"")
+    .replace(/[Ａ-Ｚａ-ｚ０-９]/g, s=>String.fromCharCode(s.charCodeAt(0)-0xFEE0))
+    .toLowerCase();
+}
 
-// =========================
-/** Firestore: shops を県で取得（publishedのみ） */
-// =========================
+// --------------------
+// shops（公開データ）
+// --------------------
 async function fetchShopsByPref(pref, keyword=""){
   const qCol = collection(db, "shops");
-  // 県で絞り込み
-  const q = query(qCol, where("pref","==",pref), where("status","==","published"));
-  const snap = await getDocs(q);
+  const qy = query(qCol, where("pref","==",pref), where("status","==","published"));
+  const snap = await getDocs(qy);
   let rows = snap.docs.map(d=>({id:d.id, ...d.data()}));
   if(keyword){
     const ql = keyword.toLowerCase();
@@ -108,75 +113,196 @@ async function fetchShopsByPref(pref, keyword=""){
       return s.includes(ql);
     });
   }
-  // 並び（任意）：店名昇順
   rows.sort((a,b)=>(a.name||"").localeCompare(b.name||""));
   return rows;
 }
 
-// =========================
-// Firestore: Favorites
-// =========================
-async function isFav(shopId){
-  if(!currentUser) return false;
-  const favRef = doc(db, "users", currentUser.uid, "favorites", shopId);
-  const snap = await getDoc(favRef);
-  return snap.exists();
+// --------------------
+// Favorites（効率版）
+// --------------------
+import { onSnapshot as onSnap } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+let favUnsub = null;
+let favSet = new Set(); // shopId の集合
+
+function startWatchFavorites() {
+  if (favUnsub) { favUnsub(); favUnsub=null; }
+  if (!currentUser) { favSet = new Set(); return; }
+  const col = collection(db, "users", currentUser.uid, "favorites");
+  favUnsub = onSnap(col, snap => {
+    favSet = new Set(snap.docs.map(d => d.id));
+    // 画面の⭐を即時更新
+    if (state.tab === "home" || state.tab === "favorites") render();
+  });
 }
+
 async function toggleFav(shop){
   if(!currentUser){ alert("お気に入りはログインが必要です"); return; }
   const favRef = doc(db, "users", currentUser.uid, "favorites", shop.id);
-  const snap = await getDoc(favRef);
-  if(snap.exists()){
-    await deleteDoc(favRef);
-  }else{
-    await setDoc(favRef, {
-      shopRef: doc(db,"shops",shop.id),
-      createdAt: serverTimestamp()
-    });
-  }
-  // 再描画
+  const existed = favSet.has(shop.id);
+
+  // 楽観更新
+  if (existed) favSet.delete(shop.id); else favSet.add(shop.id);
   render();
+
+  try {
+    if (existed) await deleteDoc(favRef);
+    else await setDoc(favRef, { shopRef: doc(db,"shops",shop.id), createdAt: serverTimestamp() });
+  } catch(e){
+    // ロールバック
+    if (existed) favSet.add(shop.id); else favSet.delete(shop.id);
+    render();
+    alert("更新に失敗しました: " + e.message);
+  }
 }
+
 async function fetchFavorites(){
   if(!currentUser) return [];
-  const favCol = collection(db, "users", currentUser.uid, "favorites");
-  const snap = await getDocs(favCol);
+  const snap = await getDocs(collection(db, "users", currentUser.uid, "favorites"));
   const results = [];
-  for(const d of snap.docs){
+  for (const d of snap.docs){
     const shopId = d.id;
     const sdoc = await getDoc(doc(db,"shops",shopId));
     if(sdoc.exists()){
       results.push({ id: shopId, ...sdoc.data() });
     }
   }
-  // 店名昇順
   results.sort((a,b)=>(a.name||"").localeCompare(b.name||""));
   return results;
 }
 
-// =========================
-// Firestore: Submissions（審査待ち）
-// =========================
-async function submitNewShop(model){
-  await addDoc(collection(db, "submissions"), {
-    ...model,
-    status: "pending",
-    submittedByUid: currentUser ? currentUser.uid : null,
-    createdAt: serverTimestamp()
-  });
+// --------------------
+// Submissions（新規登録）
+//  - バリデーション
+//  - 重複チェック（pref＋name/addressの簡易一致）
+//  - レート制限（クライアントで60秒/回 + ペンディング上限）
+//  - 自分の申請一覧の表示・編集（pendingのみ）・削除
+// --------------------
+const SUBMIT_COOLDOWN_MS = 60 * 1000; // 60s
+const PENDING_LIMIT_PER_USER = 10;
+
+function getLastSubmitTs(){
+  try{ return Number(localStorage.getItem("udon_submit_lastts")||"0"); }catch(_e){ return 0; }
+}
+function setLastSubmitTs(ts){ try{ localStorage.setItem("udon_submit_lastts", String(ts)); }catch(_e){} }
+
+async function hasPendingQuota(){
+  if(!currentUser) return true; // 未ログインはクライアント側で弾くのでここは通る
+  const qy = query(collection(db,"submissions"),
+    where("submittedByUid","==", currentUser.uid),
+    where("status","==","pending"),
+    limit(PENDING_LIMIT_PER_USER)
+  );
+  const snap = await getDocs(qy);
+  return snap.size < PENDING_LIMIT_PER_USER;
 }
 
-// =========================
+async function checkDuplicate(pref, name, address){
+  // 既存shops（published）に同名 or 同住所があれば重複判定
+  const rows = await fetchShopsByPref(pref, "");
+  const keyName = normalizeKey(name);
+  const keyAddr = normalizeKey(address);
+  const dup = rows.find(r=>{
+    return normalizeKey(r.name) === keyName || normalizeKey(r.address||"") === keyAddr;
+  });
+  return dup || null;
+}
+
+async function submitNewShop(model){
+  const now = Date.now();
+
+  // レート制限（クライアント側）
+  const last = getLastSubmitTs();
+  if (now - last < SUBMIT_COOLDOWN_MS){
+    const sec = Math.ceil((SUBMIT_COOLDOWN_MS - (now-last))/1000);
+    throw new Error(`送信間隔が短すぎます。${sec}秒後に再度お試しください。`);
+  }
+
+  // ログイン推奨（未ログインでも受け付けたい場合はここを外す）
+  if(!currentUser){
+    throw new Error("申請はログインが必要です（審査状況の確認・編集のため）");
+  }
+
+  // ペンディング上限
+  if(!(await hasPendingQuota())){
+    throw new Error(`審査中の申請が上限（${PENDING_LIMIT_PER_USER}件）に達しています。結果が出るまでお待ちください。`);
+  }
+
+  // 重複チェック
+  const dup = await checkDuplicate(model.pref, model.name, model.address);
+  if (dup){
+    throw new Error(`既に掲載済みの可能性があります：「${dup.name}」（${dup.address||""}）`);
+  }
+
+  const payload = {
+    pref: normalize(model.pref),
+    name: normalize(model.name),
+    address: normalize(model.address),
+    note: normalize(model.note),
+    nameKey: normalizeKey(model.name),
+    addrKey: normalizeKey(model.address),
+    status: "pending",
+    submittedByUid: currentUser.uid,
+    submittedByEmail: currentUser.email || null,
+    userAgent: navigator.userAgent || null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp()
+  };
+
+  await addDoc(collection(db, "submissions"), payload);
+  setLastSubmitTs(now);
+}
+
+// 自分の申請一覧（最新順）
+async function fetchMySubmissions(){
+  if(!currentUser) return [];
+  const qy = query(
+    collection(db,"submissions"),
+    where("submittedByUid","==", currentUser.uid),
+    orderBy("createdAt","desc")
+  );
+  const snap = await getDocs(qy);
+  return snap.docs.map(d=>({ id:d.id, ...d.data() }));
+}
+
+// 申請編集（pendingのみ）
+async function updateSubmission(id, patch){
+  const ref = doc(db,"submissions", id);
+  const cur = await getDoc(ref);
+  if(!cur.exists()) throw new Error("申請が見つかりません");
+  const data = cur.data();
+  if(!currentUser || data.submittedByUid !== currentUser.uid) throw new Error("権限がありません");
+  if(data.status !== "pending") throw new Error("審査中以外は編集できません");
+  const next = {
+    ...patch,
+    nameKey: normalizeKey(patch.name ?? data.name),
+    addrKey: normalizeKey(patch.address ?? data.address),
+    updatedAt: serverTimestamp()
+  };
+  await setDoc(ref, next, { merge: true });
+}
+
+// 申請削除（pendingのみ）
+async function deleteSubmission(id){
+  const ref = doc(db,"submissions", id);
+  const cur = await getDoc(ref);
+  if(!cur.exists()) return;
+  const data = cur.data();
+  if(!currentUser || data.submittedByUid !== currentUser.uid) throw new Error("権限がありません");
+  if(data.status !== "pending") throw new Error("審査中以外は削除できません");
+  await deleteDoc(ref);
+}
+
+// --------------------
 // Views
-// =========================
+// --------------------
 async function render(){
   document.querySelectorAll('.tab').forEach(btn=>{
     btn.classList.toggle('active', btn.dataset.tab === state.tab);
   });
 
-  if(state.tab === "home")  await renderHome();
-  if(state.tab === "favorites") await renderFavorites();
-  if(state.tab === "new")   renderNew();
+  if(state.tab === "home")       await renderHome();
+  if(state.tab === "favorites")  await renderFavorites();
+  if(state.tab === "new")        await renderNew();
 }
 
 // Home
@@ -184,7 +310,6 @@ async function renderHome(){
   const container = document.createElement('div');
   container.className = 'container';
 
-  // 都道府県選択
   container.appendChild(h2('都道府県を選ぶ'));
   const grid = document.createElement('div');
   grid.className = 'pref-grid';
@@ -197,7 +322,6 @@ async function renderHome(){
   });
   container.appendChild(grid);
 
-  // リスト表示
   if(state.selectedPref){
     container.appendChild(document.createElement('hr'));
     const t = document.createElement('h3'); t.className = 'section-title';
@@ -221,7 +345,6 @@ async function renderHome(){
 
     appRoot.replaceChildren(container);
 
-    // データ読み込み
     const rows = await fetchShopsByPref(state.selectedPref, state.search);
     const list = document.createElement('div'); list.className = 'list';
 
@@ -249,11 +372,7 @@ async function renderHome(){
 
       const favBtn = document.createElement('button');
       favBtn.className='btn btn-outline';
-      favBtn.textContent = '☆ お気に入り';
-      // 非同期で状態反映
-      isFav(r.id).then(flag=>{
-        favBtn.textContent = flag ? '★ お気に入り済' : '☆ お気に入り';
-      });
+      favBtn.textContent = favSet.has(r.id) ? '★ お気に入り済' : '☆ お気に入り';
       favBtn.onclick = ()=>toggleFav(r);
 
       actions.append(detailBtn, favBtn);
@@ -288,8 +407,7 @@ function renderDetail(shop){
   map.textContent = 'Googleマップで開く';
 
   const fav = document.createElement('button'); fav.className='btn btn-outline';
-  fav.textContent = '☆ お気に入り';
-  isFav(shop.id).then(flag=>{ fav.textContent = flag ? '★ お気に入り済' : '☆ お気に入り'; });
+  fav.textContent = favSet.has(shop.id) ? '★ お気に入り済' : '☆ お気に入り';
   fav.onclick = ()=>{ toggleFav(shop); };
 
   const back = document.createElement('button'); back.className='btn btn-ghost'; back.textContent='戻る';
@@ -346,7 +464,7 @@ async function renderFavorites(){
   listWrap.replaceChildren(list);
 }
 
-// 新規登録（審査待ち）
+// 新規登録（審査制・実運用版）
 function renderNew(){
   const container = document.createElement('div');
   container.className='container';
@@ -358,9 +476,9 @@ function renderNew(){
 
   const rows = [
     {key:'pref', label:'都道府県', el: ()=>selectPref()},
-    {key:'name', label:'店名', el: ()=>inputText('例）うどん処 ○○')},
-    {key:'address', label:'住所', el: ()=>inputText('例）福岡市○○区…')},
-    {key:'note', label:'メモ', el: ()=>inputText('任意：特徴など')}
+    {key:'name', label:'店名', el: ()=>inputText('例）うどん処 ○○（必須）', 64)},
+    {key:'address', label:'住所', el: ()=>inputText('例）福岡市○○区…（必須）', 128)},
+    {key:'note', label:'メモ', el: ()=>inputText('任意：名物や補足など', 128)}
   ];
 
   rows.forEach(r=>{
@@ -376,10 +494,19 @@ function renderNew(){
   const actions = document.createElement('div'); actions.className='actions';
   const send = document.createElement('button'); send.className='btn btn-primary'; send.textContent='申請する';
   send.onclick = async ()=>{
-    if(!model.name || !model.address){ alert('店名と住所は必須です'); return; }
-    await submitNewShop(model).catch(e=>alert(e.message));
-    alert('送信しました。審査後に掲載されます。');
-    state.tab = 'home'; state.selectedPref = model.pref; render();
+    try{
+      // クライアント側バリデーション
+      if(!normalize(model.name) || !normalize(model.address)){
+        alert('店名と住所は必須です'); return;
+      }
+      // 送信
+      await submitNewShop(model);
+      alert('送信しました。審査後に掲載されます。');
+      // 送信後は自分の申請一覧を表示
+      renderMySubmissionsView(container);
+    }catch(e){
+      alert(e.message);
+    }
   };
   const cancel = document.createElement('button'); cancel.className='btn btn-outline'; cancel.textContent='キャンセル';
   cancel.onclick = ()=>{ state.tab='home'; render(); };
@@ -388,18 +515,21 @@ function renderNew(){
   form.appendChild(actions);
   container.append(title,form);
 
-  // 補助: 投稿時はログイン推奨
+  // 補助メッセージ
   if(!currentUser){
     const note = document.createElement('div');
     note.className = 'empty';
-    note.textContent = '※ ログインすると投稿があなたのアカウントに紐づきます。';
+    note.textContent = '※ ログインすると申請の編集・削除ができ、審査状況も確認できます。';
     container.appendChild(note);
+  }else{
+    // 自分の申請一覧（同一画面内に表示）
+    renderMySubmissionsView(container);
   }
 
   appRoot.replaceChildren(container);
 
-  function inputText(ph){
-    const i = document.createElement('input'); i.className='input'; i.placeholder=ph; return i;
+  function inputText(ph, max=128){
+    const i = document.createElement('input'); i.className='input'; i.placeholder=ph; i.maxLength = max; return i;
   }
   function selectPref(){
     const s = document.createElement('select'); s.className='select';
@@ -408,9 +538,83 @@ function renderNew(){
   }
 }
 
-// =========================
+// 自分の申請一覧UI（編集・削除対応）
+async function renderMySubmissionsView(container){
+  const wrap = document.createElement('div');
+  wrap.style.marginTop = '16px';
+
+  const title = document.createElement('h3'); title.className='section-title'; title.textContent = 'あなたの申請一覧';
+  wrap.appendChild(title);
+
+  if(!currentUser){
+    const empty = document.createElement('div'); empty.className='empty';
+    empty.textContent = 'ログインすると申請履歴を確認できます。';
+    wrap.appendChild(empty);
+    container.appendChild(wrap);
+    return;
+  }
+
+  const listWrap = document.createElement('div'); listWrap.appendChild(loader());
+  wrap.appendChild(listWrap);
+  container.appendChild(wrap);
+
+  const rows = await fetchMySubmissions();
+  if(rows.length===0){
+    const empty = document.createElement('div'); empty.className='empty';
+    empty.textContent = '申請はまだありません。';
+    listWrap.replaceChildren(empty);
+    return;
+  }
+
+  const list = document.createElement('div'); list.className='list';
+  rows.forEach(r=>{
+    const card = document.createElement('div'); card.className='card';
+    const h3 = document.createElement('h3'); h3.textContent = r.name;
+    const meta = document.createElement('div'); meta.className='meta';
+    meta.innerHTML = `
+      <span class="badge">${r.pref}</span>
+      <div>${r.address??""}</div>
+      ${r.note?`<div>${r.note}</div>`:""}
+      <div>ステータス：<strong>${r.status}</strong></div>
+    `;
+
+    const actions = document.createElement('div'); actions.className='actions';
+
+    const map = document.createElement('a'); map.className='btn btn-primary';
+    map.href = mapsLinkFromAddress(r.address??""); map.target="_blank"; map.rel="noopener";
+    map.textContent='地図';
+
+    const canEdit = r.status === "pending" && currentUser && r.submittedByUid === currentUser.uid;
+    const edit = document.createElement('button'); edit.className='btn btn-outline'; edit.textContent='編集';
+    edit.disabled = !canEdit;
+    edit.onclick = async ()=>{
+      const name = prompt('店名を修正', r.name); if(name===null) return;
+      const address = prompt('住所を修正', r.address); if(address===null) return;
+      const note = prompt('メモを修正（空でも可）', r.note ?? ""); if(note===null) return;
+      try{
+        await updateSubmission(r.id, { name, address, note });
+        alert('更新しました'); render();
+      }catch(e){ alert(e.message); }
+    };
+
+    const del = document.createElement('button'); del.className='btn'; del.textContent='削除';
+    del.disabled = !canEdit;
+    del.onclick = async ()=>{
+      if(!confirm('この申請を削除しますか？')) return;
+      try{ await deleteSubmission(r.id); alert('削除しました'); render(); }
+      catch(e){ alert(e.message); }
+    };
+
+    actions.append(map, edit, del);
+    card.append(h3, meta, actions);
+    list.appendChild(card);
+  });
+  listWrap.replaceChildren(list);
+}
+
+// --------------------
 // Tabs
-// =========================
+// --------------------
 document.getElementById('tabs').addEventListener('click', (e)=>{
   const btn = e.target.closest('button.tab');
   if(!btn) return;
