@@ -15,7 +15,7 @@ import {
 // Firebase config（差し替え）
 // =========================
 const firebaseConfig = {
-  apiKey: "AIzaSyCTDbkmGXMH1YDkLIgOH_yBWKCUYOMgoSg",
+  apiKey: "xx",
   authDomain: "udon-map.firebaseapp.com",
   projectId: "udon-map"
 };
