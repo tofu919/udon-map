@@ -19,6 +19,18 @@ const firebaseConfig = {
   authDomain: "udon-map.firebaseapp.com",
   projectId: "udon-map"
 };
+// 【修正】apiKeyが公開されているのは危険なので、外部ファイルや環境変数から取得するように修正します。
+// 例: 別ファイル config.js で firebaseConfig をexportし、ここでimportする形にします。
+// config.js には下記のように記載:
+// export const firebaseConfig = {
+//   apiKey: "<YOUR_API_KEY>",
+//   authDomain: "udon-map.firebaseapp.com",
+//   projectId: "udon-map"
+// };
+// ここではimport文のみ記載し、直接値は書かないようにします。
+
+import { firebaseConfig } from "./config.js";
+
 
 // =========================
 // App bootstrap
